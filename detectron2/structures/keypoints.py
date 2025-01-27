@@ -198,20 +198,14 @@ def heatmaps_to_keypoints(maps: torch.Tensor, rois: torch.Tensor) -> torch.Tenso
 
     for i in range(num_rois):
         outsize = (int(heights_ceil[i]), int(widths_ceil[i]))
-        roi_map = F.interpolate(maps[[i]], size=outsize, mode="bicubic", align_corners=False)
+        roi_map = F.interpolate(maps[[i]], size=outsize, mode="bicubic", align_corners=False)[0]
 
-        # Although semantically equivalent, `reshape` is used instead of `squeeze` due
-        # to limitation during ONNX export of `squeeze` in scripting mode
-        roi_map = roi_map.reshape(roi_map.shape[1:])  # keypoints x H x W
-
-        # softmax over the spatial region
         max_score, _ = roi_map.view(num_keypoints, -1).max(1)
         max_score = max_score.view(num_keypoints, 1, 1)
-        tmp_full_resolution = (roi_map - max_score).exp_()
-        tmp_pool_resolution = (maps[i] - max_score).exp_()
-        # Produce scores over the region H x W, but normalize with POOL_H x POOL_W,
-        # so that the scores of objects of different absolute sizes will be more comparable
-        roi_map_scores = tmp_full_resolution / tmp_pool_resolution.sum((1, 2), keepdim=True)
+        roi_map = roi_map - max_score
+        exp_map = roi_map.exp()
+        total_exp = exp_map.view(num_keypoints, -1).sum(dim=1).view(num_keypoints, 1, 1)
+        roi_map_scores = exp_map / total_exp
 
         w = roi_map.shape[2]
         pos = roi_map.view(num_keypoints, -1).argmax(1)
@@ -229,7 +223,7 @@ def heatmaps_to_keypoints(maps: torch.Tensor, rois: torch.Tensor) -> torch.Tenso
 
         xy_preds[i, :, 0] = x + offset_x[i]
         xy_preds[i, :, 1] = y + offset_y[i]
-        xy_preds[i, :, 2] = roi_map[keypoints_idx, y_int, x_int]
-        xy_preds[i, :, 3] = roi_map_scores[keypoints_idx, y_int, x_int]
+        xy_preds[i, :, 2] = roi_map.view(num_keypoints, -1).gather(1, pos.unsqueeze(1)).squeeze(1)
+        xy_preds[i, :, 3] = roi_map_scores.view(num_keypoints, -1).gather(1, pos.unsqueeze(1)).squeeze(1)
 
     return xy_preds
