@@ -2,7 +2,10 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 import argparse
 import os
+from pathlib import Path
 from typing import Dict, List, Tuple
+
+import cv2
 import torch
 from torch import Tensor, nn
 
@@ -25,13 +28,18 @@ from detectron2.utils.env import TORCH_VERSION
 from detectron2.utils.file_io import PathManager
 from detectron2.utils.logger import setup_logger
 
+from lidar_greeting.configs.train_configs import config_factory
+from lidar_greeting.dev.dataset_utils import register_coco_custom_dataset
+from lidar_greeting.dev.evaluators import IRFPredictor, get_evaluation_loader
+from lidar_greeting.dev.greeting_mapper import IRFGreetingDatasetMapper
+
 
 def setup_cfg(args):
-    cfg = get_cfg()
-    # cuda context is initialized before creating dataloader, so we don't fork anymore
+    configurator = config_factory("irf")
+    cfg = configurator.config_setup(train_name="greeting_train", val_name="greeting_val")    # cuda context is initialized before creating dataloader, so we don't fork anymore
     cfg.DATALOADER.NUM_WORKERS = 0
     add_pointrend_config(cfg)
-    cfg.merge_from_file(args.config_file)
+    # cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()
     return cfg
@@ -151,7 +159,7 @@ def export_tracing(torch_model, inputs):
     return eval_wrapper
 
 
-def get_sample_inputs(args):
+def get_sample_inputs(args, do_resize=False):
 
     if args.sample_image is None:
         # get a first batch from dataset
@@ -162,11 +170,14 @@ def get_sample_inputs(args):
         # get a sample data
         original_image = detection_utils.read_image(args.sample_image, format=cfg.INPUT.FORMAT)
         # Do same preprocessing as DefaultPredictor
-        aug = T.ResizeShortestEdge(
-            [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
-        )
+        if do_resize:
+            aug = T.ResizeShortestEdge(
+                [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
+            )
+            image = aug.get_transform(original_image).apply_image(original_image)
+        else:
+            image = original_image
         height, width = original_image.shape[:2]
-        image = aug.get_transform(original_image).apply_image(original_image)
         image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
 
         inputs = {"image": image, "height": height, "width": width}
@@ -174,6 +185,20 @@ def get_sample_inputs(args):
         # Sample ready
         sample_inputs = [inputs]
         return sample_inputs
+
+
+def get_sample_irf(args, do_resize=False):
+
+    config_type = "irf"
+    read_strategy = IRFGreetingDatasetMapper.read_irf_images if config_type == "irf" else cv2.imread
+    sample_inputs = read_strategy(args.sample_image)
+    height, width = sample_inputs.shape[:2]
+    # No need for resize
+    image = torch.as_tensor(sample_inputs.astype("float32").transpose(2, 0, 1))
+
+    inputs = {"image": image, "height": height, "width": width}
+
+    return [inputs]
 
 
 def main() -> None:
@@ -201,6 +226,17 @@ def main() -> None:
         default=None,
         nargs=argparse.REMAINDER,
     )
+
+    train_name = "greeting_train"
+    train_json = "/home/edan/Public/Data/keymakr_labels_greeting/modified_combined_almonds/train_almonds.json"
+    val_name = "greeting_val"
+    val_json = "/home/edan/Public/Data/keymakr_labels_greeting/modified_combined_almonds/val_almonds.json"
+    images_dir = Path(
+        "/home/edan/Public/Data/Greeting_POC_Dataset/almonds_project/almonds_images_greeting/intensities/")
+    register_coco_custom_dataset(val_name, val_json, images_dir=images_dir)
+    config_type = "irf"
+
+    _, val_meta_data = register_coco_custom_dataset(val_name, val_json, images_dir)
     args = parser.parse_args()
     logger = setup_logger()
     logger.info("Command line arguments: " + str(args))
@@ -222,7 +258,8 @@ def main() -> None:
     elif args.export_method == "scripting":
         exported_model = export_scripting(torch_model)
     elif args.export_method == "tracing":
-        sample_inputs = get_sample_inputs(args)
+        # sample_inputs = get_sample_inputs(args)
+        sample_inputs = get_sample_irf(args)
         exported_model = export_tracing(torch_model, sample_inputs)
 
     # run evaluation with the converted model
@@ -232,11 +269,13 @@ def main() -> None:
             f"export_method={args.export_method}, format={args.format}."
         )
         logger.info("Running evaluation ... this takes a long time if you export to CPU.")
-        dataset = cfg.DATASETS.TEST[0]
-        data_loader = build_detection_test_loader(cfg, dataset)
-        # NOTE: hard-coded evaluator. change to the evaluator for your dataset
-        evaluator = COCOEvaluator(dataset, output_dir=args.output)
-        metrics = inference_on_dataset(exported_model, data_loader, evaluator)
+        # dataset = cfg.DATASETS.TEST[0]
+        # data_loader = build_detection_test_loader(cfg, dataset)
+        # # NOTE: hard-coded evaluator. change to the evaluator for your dataset
+        # evaluator = COCOEvaluator(dataset, output_dir=args.output)
+        evaluator = COCOEvaluator(val_name, output_dir=cfg.OUTPUT_DIR, kpt_oks_sigmas=[1, 1, 1, 1])
+        val_loader =  get_evaluation_loader(config_type, cfg, val_name)
+        metrics = inference_on_dataset(exported_model, val_loader, evaluator)
         print_csv_format(metrics)
     logger.info("Success.")
 
