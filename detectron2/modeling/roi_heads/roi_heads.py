@@ -875,3 +875,70 @@ class StandardROIHeads(ROIHeads):
         else:
             features = {f: features[f] for f in self.keypoint_in_features}
         return self.keypoint_head(features, instances)
+
+@ROI_HEADS_REGISTRY.register()
+class RangeStandardROIHeads(StandardROIHeads):
+
+    def forward(
+        self,
+        images: ImageList,
+        features: Dict[str, torch.Tensor],
+        proposals: List[Instances],
+        targets: Optional[List[Instances]] = None,
+        range_ims: List[torch.Tensor] = None,
+    ) -> Tuple[List[Instances], Dict[str, torch.Tensor]]:
+        """
+        See :class:`ROIHeads.forward`.
+        """
+        del images
+        if self.training:
+            assert targets, "'targets' argument is required during training"
+            proposals = self.label_and_sample_proposals(proposals, targets)
+        del targets
+
+        if self.training:
+            losses = self._forward_box(features, proposals)
+            # Usually the original proposals used by the box head are used by the mask, keypoint
+            # heads. But when `self.train_on_pred_boxes is True`, proposals will contain boxes
+            # predicted by the box head.
+            losses.update(self._forward_mask(features, proposals))
+            losses.update(self._forward_keypoint(features, proposals, range_ims))
+            return proposals, losses
+        else:
+            pred_instances = self._forward_box(features, proposals)
+            # During inference cascaded prediction is used: the mask and keypoints heads are only
+            # applied to the top scoring box detections.
+            pred_instances = self.forward_with_given_boxes(features, pred_instances)
+            return pred_instances, {}
+
+    def _forward_keypoint(self, features: Dict[str, torch.Tensor], instances: List[Instances],
+                          range_imgs: List[torch.Tensor] = None):
+        """
+        Forward logic of the keypoint prediction branch.
+
+        Args:
+            features (dict[str, Tensor]): mapping from feature map names to tensor.
+                Same as in :meth:`ROIHeads.forward`.
+            instances (list[Instances]): the per-image instances to train/predict keypoints.
+                In training, they can be the proposals.
+                In inference, they can be the boxes predicted by R-CNN box head.
+
+        Returns:
+            In training, a dict of losses.
+            In inference, update `instances` with new fields "pred_keypoints" and return it.
+        """
+        if not self.keypoint_on:
+            return {} if self.training else instances
+
+        if self.training:
+            # head is only trained on positive proposals with >=1 visible keypoints.
+            instances, _ = select_foreground_proposals(instances, self.num_classes)
+            instances = select_proposals_with_visible_keypoints(instances)
+
+        if self.keypoint_pooler is not None:
+            features = [features[f] for f in self.keypoint_in_features]
+            boxes = [x.proposal_boxes if self.training else x.pred_boxes for x in instances]
+            features = self.keypoint_pooler(features, boxes)
+        else:
+            features = {f: features[f] for f in self.keypoint_in_features}
+        return self.keypoint_head(features, instances, range_imgs)

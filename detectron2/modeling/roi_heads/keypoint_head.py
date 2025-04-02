@@ -18,6 +18,7 @@ __all__ = [
     "build_keypoint_head",
     "BaseKeypointRCNNHead",
     "KRCNNConvDeconvUpsampleHead",
+    "RangeKRCNNConvDeconvUpsampleHead"
 ]
 
 
@@ -94,6 +95,149 @@ def keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer):
     keypoint_loss /= normalizer
 
     return keypoint_loss
+
+
+def range_keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer, range_imgs):
+    """
+    Compute the keypoint loss (via cross entropy) as well as an additional range loss.
+
+    Arguments:
+        pred_keypoint_logits (Tensor): Tensor of shape (N, K, S, S) where:
+            - N is the total number of instances in the batch.
+            - K is the number of keypoints.
+            - S is the side length of the keypoint heatmap.
+            The values are spatial logits.
+        instances (list[Instances]): A list (length = batch size) of Instances objects.
+            Each Instances should contain:
+              - `gt_keypoints`: a Keypoint object with a .coordinates tensor of shape (n, K, 2).
+              - `proposal_boxes`: a Boxes object with a tensor attribute of shape (n, 4).
+        normalizer (float): Normalization factor. If None, the loss is normalized by the number of visible keypoints.
+        range_imgs (list[Tensor]): A list (length = batch size) of range image tensors, each of shape (H_img, W_img),
+            corresponding to the input images.
+
+    Returns:
+        dict[str, Tensor]: A dictionary with keys "loss_keypoint" and "loss_range".
+    """
+    # --- Compute the standard keypoint loss ---
+    heatmaps = []
+    valid = []
+    keypoint_side_len = pred_keypoint_logits.shape[2]
+
+    # Compute target heatmaps from the ground-truth keypoints
+    for instances_per_image in instances:
+        if len(instances_per_image) == 0:
+            continue
+        keypoints = instances_per_image.gt_keypoints
+        heatmaps_per_image, valid_per_image = keypoints.to_heatmap(
+            instances_per_image.proposal_boxes.tensor, keypoint_side_len
+        )
+        heatmaps.append(heatmaps_per_image.view(-1))
+        valid.append(valid_per_image.view(-1))
+
+    if len(heatmaps):
+        keypoint_targets = cat(heatmaps, dim=0)
+        valid = cat(valid, dim=0).to(dtype=torch.uint8)
+        valid = torch.nonzero(valid).squeeze(1)
+
+    if len(heatmaps) == 0 or valid.numel() == 0:
+        global _TOTAL_SKIPPED
+        _TOTAL_SKIPPED += 1
+        storage = get_event_storage()
+        storage.put_scalar("kpts_num_skipped_batches", _TOTAL_SKIPPED, smoothing_hint=False)
+        zero_loss = pred_keypoint_logits.sum() * 0
+        return zero_loss, zero_loss
+
+    # Save the original shape and a copy of the logits for range loss computation.
+    N, K, S, _ = pred_keypoint_logits.shape  # S is the keypoint heatmap size.
+    pred_logits_orig = pred_keypoint_logits  # (N, K, S, S)
+    pred_keypoint_logits_flat = pred_keypoint_logits.view(N * K, S * S)
+
+    keypoint_loss = F.cross_entropy(
+        pred_keypoint_logits_flat[valid], keypoint_targets[valid], reduction="sum"
+    )
+
+    if normalizer is None:
+        normalizer = valid.numel()
+    keypoint_loss /= normalizer
+
+    # --- Compute the range loss ---
+    #
+    # For each instance, we compute a differentiable estimate of its keypoint coordinates by applying
+    # a soft-argmax over the heatmap (which is in the coordinate system of the proposal box). We then
+    # sample the corresponding range image at both the predicted coordinate and the ground truth coordinate,
+    # and compute an L1 loss between them.
+
+    # Helper: Soft-argmax over one keypoint heatmap given the proposal box.
+    def soft_argmax(heatmap, box):
+        # heatmap: (S, S)
+        S_local = heatmap.shape[0]
+        heatmap_flat = heatmap.view(-1)
+        prob = F.softmax(heatmap_flat, dim=0)
+        prob = prob.view(S_local, S_local)
+        device = heatmap.device
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(S_local, device=device, dtype=torch.float32),
+            torch.arange(S_local, device=device, dtype=torch.float32),
+            indexing="ij",
+        )
+        exp_x = (prob * grid_x).sum()
+        exp_y = (prob * grid_y).sum()
+        # Transform heatmap coordinates to image coordinates based on the proposal box.
+        # The proposal box (box) is given as [x1, y1, x2, y2]
+        x1, y1, x2, y2 = box  # each a scalar
+        box_width = x2 - x1
+        box_height = y2 - y1
+        pred_x = x1 + (exp_x + 0.5) * (box_width / S_local)
+        pred_y = y1 + (exp_y + 0.5) * (box_height / S_local)
+        return pred_x, pred_y
+
+    # Helper: Sample a range value from a range image at a given (x, y) coordinate.
+    def sample_range_value(range_img, coord):
+        # range_img: (H_img, W_img)
+        # coord: tuple (x, y) in image coordinates.
+        H_img, W_img = range_img.shape
+        x, y = coord
+        norm_x = (x / (W_img - 1)) * 2 - 1  # Normalize to [-1, 1]
+        norm_y = (y / (H_img - 1)) * 2 - 1  # Normalize to [-1, 1]
+        # grid_sample expects a grid of shape (N, H_out, W_out, 2); here we sample a single point.
+        grid = torch.tensor([[[[norm_x, norm_y]]]], device=range_img.device, dtype=torch.float32)
+        range_img_unsq = range_img.unsqueeze(0).unsqueeze(0)  # (1, 1, H_img, W_img)
+        sampled = F.grid_sample(range_img_unsq, grid, align_corners=True)
+        return sampled.squeeze()  # scalar
+
+    range_loss_total = 0.0
+    count = 0
+    offset = 0  # To index into pred_logits_orig (which is a concatenation over images)
+
+    # Iterate over images in the batch
+    for i, instances_per_image in enumerate(instances):
+        if len(instances_per_image) == 0:
+            continue
+        range_img = range_imgs[i]  # Tensor of shape (H_img, W_img)
+        boxes = instances_per_image.proposal_boxes.tensor  # (num_instances, 4)
+        # Assume gt_keypoints.coordinates is available and of shape (num_instances, K, 2)
+        gt_keypoints = instances_per_image.gt_keypoints.tensor[:, :, :2]  # (num_instances, K, 2)
+        num_instances = boxes.shape[0]
+        for j in range(num_instances):
+            box = boxes[j]  # (4,)
+            instance_heatmaps = pred_logits_orig[offset + j]  # (K, S, S)
+            for k in range(K):
+                heatmap = instance_heatmaps[k]  # (S, S)
+                pred_x, pred_y = soft_argmax(heatmap, box)
+                # Ground-truth coordinate for keypoint k for this instance:
+                gt_coord = gt_keypoints[j, k]  # (2,)
+                pred_range = sample_range_value(range_img, (pred_x, pred_y))
+                gt_range = sample_range_value(range_img, (gt_coord[0], gt_coord[1]))
+                range_loss_total += F.l1_loss(pred_range, gt_range, reduction="mean")
+                count += 1
+        offset += num_instances
+
+    if count > 0:
+        range_loss = range_loss_total / count
+    else:
+        range_loss = torch.tensor(0.0, device=pred_keypoint_logits.device)
+
+    return keypoint_loss, range_loss
 
 
 def keypoint_rcnn_inference(pred_keypoint_logits: torch.Tensor, pred_instances: List[Instances]):
@@ -270,3 +414,118 @@ class KRCNNConvDeconvUpsampleHead(BaseKeypointRCNNHead, nn.Sequential):
             x = layer(x)
         x = interpolate(x, scale_factor=self.up_scale, mode="bilinear", align_corners=False)
         return x
+
+
+def sample_range_channel(range_img, keypoints):
+    """
+    Samples the range channel from a 2D tensor image at given keypoint locations.
+
+    Args:
+        range_img (Tensor): A tensor of shape (H, W) representing the range image.
+        keypoints (Tensor): A tensor of shape (N, 2) with (x, y) coordinates.
+
+    Returns:
+        Tensor: The sampled range values for each keypoint.
+    """
+    H, W = range_img.shape[-2:]
+    norm_keypoints = keypoints.clone().float()
+    norm_keypoints[:, 0] = (norm_keypoints[:, 0] / (W - 1)) * 2 - 1  # Normalize x
+    norm_keypoints[:, 1] = (norm_keypoints[:, 1] / (H - 1)) * 2 - 1  # Normalize y
+    grid = norm_keypoints.view(1, 1, -1, 2)  # (1, 1, N, 2)
+    range_img = range_img.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    sampled = F.grid_sample(range_img, grid, align_corners=True)
+    return sampled.view(-1)
+
+
+def sample_range_channel(range_img, keypoints):
+    """
+    Samples the range channel from a 2D tensor at given keypoint locations.
+
+    Args:
+        range_img (Tensor): Tensor of shape (H, W) representing the range image.
+        keypoints (Tensor): Tensor of shape (N, 2) with (x, y) coordinates.
+
+    Returns:
+        Tensor: The sampled range values for each keypoint.
+    """
+    H, W = range_img.shape[-2:]
+    norm_keypoints = keypoints.clone().float()
+    norm_keypoints[:, 0] = (norm_keypoints[:, 0] / (W - 1)) * 2 - 1  # Normalize x to [-1, 1]
+    norm_keypoints[:, 1] = (norm_keypoints[:, 1] / (H - 1)) * 2 - 1  # Normalize y to [-1, 1]
+    grid = norm_keypoints.view(1, 1, -1, 2)  # (1, 1, N, 2)
+    range_img = range_img.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    sampled = F.grid_sample(range_img, grid, align_corners=True)
+    return sampled.view(-1)
+
+
+def soft_argmax_2d(heatmaps):
+    """
+    Computes differentiable keypoint coordinates from heatmaps using a soft-argmax.
+
+    Args:
+        heatmaps (Tensor): Tensor of shape (B, K, H, W) representing the predicted keypoint heatmaps.
+
+    Returns:
+        Tensor: Predicted coordinates of shape (B, K, 2) where the last dimension is (x, y).
+    """
+    B, K, H, W = heatmaps.shape
+    # Reshape and apply softmax over spatial dimensions
+    heatmaps_reshaped = heatmaps.view(B, K, -1)
+    softmax_heatmaps = F.softmax(heatmaps_reshaped, dim=-1)
+    softmax_heatmaps = softmax_heatmaps.view(B, K, H, W)
+
+    # Create coordinate grids
+    device = heatmaps.device
+    x_coords = torch.linspace(0, W - 1, W, device=device)
+    y_coords = torch.linspace(0, H - 1, H, device=device)
+    # Use indexing='ij' so that grid_y corresponds to rows and grid_x to columns
+    grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    grid_x = grid_x.unsqueeze(0).unsqueeze(0)  # shape (1, 1, H, W)
+    grid_y = grid_y.unsqueeze(0).unsqueeze(0)  # shape (1, 1, H, W)
+
+    # Compute expected coordinates by summing over spatial dimensions weighted by the softmax probabilities
+    expected_x = (softmax_heatmaps * grid_x).sum(dim=(-2, -1))
+    expected_y = (softmax_heatmaps * grid_y).sum(dim=(-2, -1))
+    coords = torch.stack([expected_x, expected_y], dim=-1)  # (B, K, 2)
+    return coords
+
+
+@ROI_KEYPOINT_HEAD_REGISTRY.register()
+class RangeKRCNNConvDeconvUpsampleHead(KRCNNConvDeconvUpsampleHead, nn.Sequential):
+    """
+    A standard keypoint head containing a series of 3x3 convs, followed by
+    a transpose convolution and bilinear interpolation for upsampling.
+    It is described in Sec. 5 of :paper:`Mask R-CNN`.
+
+    Also has a range-based loss function.
+    """
+
+    def forward(self, x, instances: List[Instances], range_imgs):
+        """
+        Args:
+            x: input 4D region feature(s) provided by :class:`ROIHeads`.
+            instances (list[Instances]): contains the boxes & labels corresponding
+                to the input features.
+                Exact format is up to its caller to decide.
+                Typically, this is the foreground instances in training, with
+                "proposal_boxes" field and other gt annotations.
+                In inference, it contains boxes that are already predicted.
+
+        Returns:
+            A dict of losses if in training. The predicted "instances" if in inference.
+        """
+        x = self.layers(x)
+        if self.training:
+            num_images = len(instances)
+            normalizer = (
+                None if self.loss_normalizer == "visible" else num_images * self.loss_normalizer
+            )
+            keypoint_loss, range_loss = range_keypoint_rcnn_loss(x, instances, normalizer=normalizer, range_imgs=range_imgs)
+            return {
+                "loss_keypoint": keypoint_loss
+                * self.loss_weight,
+                "range_loss": range_loss * self.loss_weight
+            }
+        else:
+            keypoint_rcnn_inference(x, instances)
+            return instances
