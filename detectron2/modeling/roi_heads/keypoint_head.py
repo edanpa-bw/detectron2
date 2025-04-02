@@ -97,33 +97,31 @@ def keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer):
     return keypoint_loss
 
 
-def range_keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer, range_imgs):
+def keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer, range_imgs):
     """
-    Compute the keypoint loss (via cross entropy) as well as an additional range loss.
+    Compute the standard keypoint loss (cross entropy over heatmaps) and an additional range loss.
+    This version vectorizes the operations for computing the range loss.
 
     Arguments:
-        pred_keypoint_logits (Tensor): Tensor of shape (N, K, S, S) where:
-            - N is the total number of instances in the batch.
-            - K is the number of keypoints.
+        pred_keypoint_logits (Tensor): Shape (N, K, S, S) where:
+            - N is the total number of instances in the batch,
+            - K is the number of keypoints,
             - S is the side length of the keypoint heatmap.
-            The values are spatial logits.
-        instances (list[Instances]): A list (length = batch size) of Instances objects.
-            Each Instances should contain:
-              - `gt_keypoints`: a Keypoint object with a .coordinates tensor of shape (n, K, 2).
-              - `proposal_boxes`: a Boxes object with a tensor attribute of shape (n, 4).
-        normalizer (float): Normalization factor. If None, the loss is normalized by the number of visible keypoints.
-        range_imgs (list[Tensor]): A list (length = batch size) of range image tensors, each of shape (H_img, W_img),
-            corresponding to the input images.
+        instances (list[Instances]): List (length = batch size) of Instances objects.
+            Each Instances must have:
+              - `proposal_boxes.tensor` of shape (n, 4)
+              - `gt_keypoints.coordinates` of shape (n, K, 2)
+        normalizer (float): Normalization factor. If None, use the number of visible keypoints.
+        range_imgs (list[Tensor]): List (length = batch size) of range image tensors, each of shape (H, W).
 
     Returns:
-        dict[str, Tensor]: A dictionary with keys "loss_keypoint" and "loss_range".
+        dict[str, Tensor]: {"loss_keypoint": ..., "loss_range": ...}
     """
-    # --- Compute the standard keypoint loss ---
+    # --- Standard keypoint loss (remains mostly unchanged) ---
     heatmaps = []
     valid = []
     keypoint_side_len = pred_keypoint_logits.shape[2]
 
-    # Compute target heatmaps from the ground-truth keypoints
     for instances_per_image in instances:
         if len(instances_per_image) == 0:
             continue
@@ -147,93 +145,112 @@ def range_keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer, range_
         zero_loss = pred_keypoint_logits.sum() * 0
         return zero_loss, zero_loss
 
-    # Save the original shape and a copy of the logits for range loss computation.
-    N, K, S, _ = pred_keypoint_logits.shape  # S is the keypoint heatmap size.
-    pred_logits_orig = pred_keypoint_logits  # (N, K, S, S)
+    N, K, S, _ = pred_keypoint_logits.shape
+    pred_logits_orig = pred_keypoint_logits  # shape (N, K, S, S)
     pred_keypoint_logits_flat = pred_keypoint_logits.view(N * K, S * S)
 
     keypoint_loss = F.cross_entropy(
         pred_keypoint_logits_flat[valid], keypoint_targets[valid], reduction="sum"
     )
-
     if normalizer is None:
         normalizer = valid.numel()
     keypoint_loss /= normalizer
 
-    # --- Compute the range loss ---
-    #
-    # For each instance, we compute a differentiable estimate of its keypoint coordinates by applying
-    # a soft-argmax over the heatmap (which is in the coordinate system of the proposal box). We then
-    # sample the corresponding range image at both the predicted coordinate and the ground truth coordinate,
-    # and compute an L1 loss between them.
+    # --- Vectorized range loss computation ---
+    # We'll compute a differentiable soft-argmax for all keypoint heatmaps per image.
+    # For each image, we need to:
+    #   (a) Extract the predicted heatmaps for that image (shape: (n, K, S, S))
+    #   (b) Compute a weighted average over the SxS grid to get predicted (x, y) in heatmap space,
+    #       then transform to image coordinates using the proposal boxes.
+    #   (c) Convert both predicted and ground-truth keypoints to normalized coordinates and
+    #       sample the range image via F.grid_sample.
 
-    # Helper: Soft-argmax over one keypoint heatmap given the proposal box.
-    def soft_argmax(heatmap, box):
-        # heatmap: (S, S)
-        S_local = heatmap.shape[0]
-        heatmap_flat = heatmap.view(-1)
-        prob = F.softmax(heatmap_flat, dim=0)
-        prob = prob.view(S_local, S_local)
-        device = heatmap.device
-        grid_y, grid_x = torch.meshgrid(
-            torch.arange(S_local, device=device, dtype=torch.float32),
-            torch.arange(S_local, device=device, dtype=torch.float32),
-            indexing="ij",
-        )
-        exp_x = (prob * grid_x).sum()
-        exp_y = (prob * grid_y).sum()
-        # Transform heatmap coordinates to image coordinates based on the proposal box.
-        # The proposal box (box) is given as [x1, y1, x2, y2]
-        x1, y1, x2, y2 = box  # each a scalar
-        box_width = x2 - x1
-        box_height = y2 - y1
-        pred_x = x1 + (exp_x + 0.5) * (box_width / S_local)
-        pred_y = y1 + (exp_y + 0.5) * (box_height / S_local)
-        return pred_x, pred_y
-
-    # Helper: Sample a range value from a range image at a given (x, y) coordinate.
-    def sample_range_value(range_img, coord):
-        # range_img: (H_img, W_img)
-        # coord: tuple (x, y) in image coordinates.
-        H_img, W_img = range_img.shape
-        x, y = coord
-        norm_x = (x / (W_img - 1)) * 2 - 1  # Normalize to [-1, 1]
-        norm_y = (y / (H_img - 1)) * 2 - 1  # Normalize to [-1, 1]
-        # grid_sample expects a grid of shape (N, H_out, W_out, 2); here we sample a single point.
-        grid = torch.tensor([[[[norm_x, norm_y]]]], device=range_img.device, dtype=torch.float32)
-        range_img_unsq = range_img.unsqueeze(0).unsqueeze(0)  # (1, 1, H_img, W_img)
-        sampled = F.grid_sample(range_img_unsq, grid, align_corners=True)
-        return sampled.squeeze()  # scalar
-
+    device = pred_keypoint_logits.device
     range_loss_total = 0.0
-    count = 0
-    offset = 0  # To index into pred_logits_orig (which is a concatenation over images)
+    total_keypoints = 0
+    offset = 0  # tracks instance offset into pred_logits_orig
 
-    # Iterate over images in the batch
+    # Pre-compute coordinate grid for heatmaps: these are the “pixel indices” in the SxS grid.
+    grid_vals = torch.arange(S * S, device=device, dtype=torch.float32)
+    grid_x = (grid_vals % S).view(1, 1, -1)  # shape (1, 1, S*S)
+    grid_y = (grid_vals // S).view(1, 1, -1)  # shape (1, 1, S*S)
+
+    # Function to normalize image coordinates for grid_sample: output in [-1, 1]
+    def normalize_coords(coords, H_img, W_img):
+        # coords: (n, K, 2) with (x, y) in image coordinates
+        norm_x = (coords[..., 0] / (W_img - 1)) * 2 - 1
+        norm_y = (coords[..., 1] / (H_img - 1)) * 2 - 1
+        return torch.stack([norm_x, norm_y], dim=2)  # (n, K, 2)
+
+    # Process each image in the batch
     for i, instances_per_image in enumerate(instances):
-        if len(instances_per_image) == 0:
+        n_i = len(instances_per_image)
+        if n_i == 0:
             continue
-        range_img = range_imgs[i]  # Tensor of shape (H_img, W_img)
-        boxes = instances_per_image.proposal_boxes.tensor  # (num_instances, 4)
-        # Assume gt_keypoints.coordinates is available and of shape (num_instances, K, 2)
-        gt_keypoints = instances_per_image.gt_keypoints.tensor[:, :, :2]  # (num_instances, K, 2)
-        num_instances = boxes.shape[0]
-        for j in range(num_instances):
-            box = boxes[j]  # (4,)
-            instance_heatmaps = pred_logits_orig[offset + j]  # (K, S, S)
-            for k in range(K):
-                heatmap = instance_heatmaps[k]  # (S, S)
-                pred_x, pred_y = soft_argmax(heatmap, box)
-                # Ground-truth coordinate for keypoint k for this instance:
-                gt_coord = gt_keypoints[j, k]  # (2,)
-                pred_range = sample_range_value(range_img, (pred_x, pred_y))
-                gt_range = sample_range_value(range_img, (gt_coord[0], gt_coord[1]))
-                range_loss_total += F.l1_loss(pred_range, gt_range, reduction="mean")
-                count += 1
-        offset += num_instances
 
-    if count > 0:
-        range_loss = range_loss_total / count
+        # Retrieve proposal boxes and ground-truth keypoints for the image:
+        # boxes: shape (n_i, 4); gt_keypoints: shape (n_i, K, 2)
+        boxes = instances_per_image.proposal_boxes.tensor  # [x1, y1, x2, y2]
+        gt_keypoints = instances_per_image.gt_keypoints.tensor
+
+        # Get predicted heatmaps for these instances:
+        # pred_heatmaps: shape (n_i, K, S, S)
+        pred_heatmaps = pred_logits_orig[offset: offset + n_i]
+        offset += n_i
+
+        # Reshape heatmaps to (n_i, K, S*S) and compute softmax:
+        pred_heatmaps_flat = pred_heatmaps.view(n_i, K, S * S)
+        probs = F.softmax(pred_heatmaps_flat, dim=2)  # shape (n_i, K, S*S)
+
+        # Compute expected coordinates in the heatmap coordinate system:
+        exp_x = (probs * grid_x).sum(dim=2)  # (n_i, K)
+        exp_y = (probs * grid_y).sum(dim=2)  # (n_i, K)
+
+        # Transform expected heatmap coordinates to image coordinates using proposal boxes.
+        # boxes: (n_i, 4) => extract x1, y1, x2, y2, and compute width and height.
+        x1 = boxes[:, 0].unsqueeze(1)  # (n_i, 1)
+        y1 = boxes[:, 1].unsqueeze(1)  # (n_i, 1)
+        x2 = boxes[:, 2].unsqueeze(1)
+        y2 = boxes[:, 3].unsqueeze(1)
+        widths = (x2 - x1)
+        heights = (y2 - y1)
+
+        # The predicted coordinates in image space:
+        pred_x = x1 + (exp_x + 0.5) * (widths / S)  # (n_i, K)
+        pred_y = y1 + (exp_y + 0.5) * (heights / S)  # (n_i, K)
+        pred_coords = torch.stack([pred_x, pred_y], dim=2)  # (n_i, K, 2)
+
+        # Convert predicted and ground-truth keypoint coordinates to normalized coordinates.
+        range_img = range_imgs[i]  # shape (H_img, W_img)
+        H_img, W_img = range_img.shape
+        norm_pred_coords = normalize_coords(pred_coords, H_img, W_img)  # (n_i, K, 2)
+        norm_gt_coords = normalize_coords(gt_keypoints, H_img, W_img)  # (n_i, K, 2)
+
+        # Reshape normalized coordinates to use with grid_sample.
+        # grid_sample expects input of shape (N, H_out, W_out, 2); here H_out=W_out=1 for each keypoint.
+        n_keypoints = n_i * K
+        grid_pred = norm_pred_coords.view(n_keypoints, 1, 1, 2)
+        grid_gt = norm_gt_coords.view(n_keypoints, 1, 1, 2)
+
+        # Prepare the range image for grid_sample:
+        # Expand the range image to shape (1, 1, H_img, W_img) and replicate for each keypoint.
+        range_img_exp = range_img.unsqueeze(0).unsqueeze(0)  # (1, 1, H_img, W_img)
+        range_img_tile = range_img_exp.expand(n_keypoints, -1, -1, -1)  # (n_keypoints, 1, H_img, W_img)
+
+        # Sample range values at the predicted and gt coordinates:
+        sampled_pred = F.grid_sample(range_img_tile, grid_pred, align_corners=True)
+        sampled_gt = F.grid_sample(range_img_tile, grid_gt, align_corners=True)
+        # Reshape to (n_i, K)
+        sampled_pred = sampled_pred.view(n_i, K)
+        sampled_gt = sampled_gt.view(n_i, K)
+
+        # Compute the L1 loss for this image (mean over all keypoints)
+        range_loss_img = F.l1_loss(sampled_pred, sampled_gt, reduction="mean")
+        range_loss_total += range_loss_img * (n_i * K)
+        total_keypoints += n_i * K
+
+    if total_keypoints > 0:
+        range_loss = range_loss_total / total_keypoints
     else:
         range_loss = torch.tensor(0.0, device=pred_keypoint_logits.device)
 
