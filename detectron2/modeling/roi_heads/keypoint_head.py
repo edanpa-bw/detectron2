@@ -97,7 +97,7 @@ def keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer):
     return keypoint_loss
 
 
-def keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer, range_imgs):
+def range_keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer, range_imgs):
     """
     Compute the standard keypoint loss (cross entropy over heatmaps) and an additional range loss.
     This version vectorizes the operations for computing the range loss.
@@ -249,12 +249,16 @@ def keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer, range_imgs):
         range_loss_total += range_loss_img * (n_i * K)
         total_keypoints += n_i * K
 
+        heatmap_probs = F.softmax(pred_keypoint_logits.view(N * K, S * S), dim=1)
+        heatmap_entropy = -(heatmap_probs * torch.log(heatmap_probs + 1e-6)).sum(dim=1)
+        heatmap_reg_loss = heatmap_entropy.mean()
+
     if total_keypoints > 0:
         range_loss = range_loss_total / total_keypoints
     else:
         range_loss = torch.tensor(0.0, device=pred_keypoint_logits.device)
 
-    return keypoint_loss, range_loss
+    return keypoint_loss, range_loss, heatmap_reg_loss
 
 
 def keypoint_rcnn_inference(pred_keypoint_logits: torch.Tensor, pred_instances: List[Instances]):
@@ -433,79 +437,6 @@ class KRCNNConvDeconvUpsampleHead(BaseKeypointRCNNHead, nn.Sequential):
         return x
 
 
-def sample_range_channel(range_img, keypoints):
-    """
-    Samples the range channel from a 2D tensor image at given keypoint locations.
-
-    Args:
-        range_img (Tensor): A tensor of shape (H, W) representing the range image.
-        keypoints (Tensor): A tensor of shape (N, 2) with (x, y) coordinates.
-
-    Returns:
-        Tensor: The sampled range values for each keypoint.
-    """
-    H, W = range_img.shape[-2:]
-    norm_keypoints = keypoints.clone().float()
-    norm_keypoints[:, 0] = (norm_keypoints[:, 0] / (W - 1)) * 2 - 1  # Normalize x
-    norm_keypoints[:, 1] = (norm_keypoints[:, 1] / (H - 1)) * 2 - 1  # Normalize y
-    grid = norm_keypoints.view(1, 1, -1, 2)  # (1, 1, N, 2)
-    range_img = range_img.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-    sampled = F.grid_sample(range_img, grid, align_corners=True)
-    return sampled.view(-1)
-
-
-def sample_range_channel(range_img, keypoints):
-    """
-    Samples the range channel from a 2D tensor at given keypoint locations.
-
-    Args:
-        range_img (Tensor): Tensor of shape (H, W) representing the range image.
-        keypoints (Tensor): Tensor of shape (N, 2) with (x, y) coordinates.
-
-    Returns:
-        Tensor: The sampled range values for each keypoint.
-    """
-    H, W = range_img.shape[-2:]
-    norm_keypoints = keypoints.clone().float()
-    norm_keypoints[:, 0] = (norm_keypoints[:, 0] / (W - 1)) * 2 - 1  # Normalize x to [-1, 1]
-    norm_keypoints[:, 1] = (norm_keypoints[:, 1] / (H - 1)) * 2 - 1  # Normalize y to [-1, 1]
-    grid = norm_keypoints.view(1, 1, -1, 2)  # (1, 1, N, 2)
-    range_img = range_img.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-    sampled = F.grid_sample(range_img, grid, align_corners=True)
-    return sampled.view(-1)
-
-
-def soft_argmax_2d(heatmaps):
-    """
-    Computes differentiable keypoint coordinates from heatmaps using a soft-argmax.
-
-    Args:
-        heatmaps (Tensor): Tensor of shape (B, K, H, W) representing the predicted keypoint heatmaps.
-
-    Returns:
-        Tensor: Predicted coordinates of shape (B, K, 2) where the last dimension is (x, y).
-    """
-    B, K, H, W = heatmaps.shape
-    # Reshape and apply softmax over spatial dimensions
-    heatmaps_reshaped = heatmaps.view(B, K, -1)
-    softmax_heatmaps = F.softmax(heatmaps_reshaped, dim=-1)
-    softmax_heatmaps = softmax_heatmaps.view(B, K, H, W)
-
-    # Create coordinate grids
-    device = heatmaps.device
-    x_coords = torch.linspace(0, W - 1, W, device=device)
-    y_coords = torch.linspace(0, H - 1, H, device=device)
-    # Use indexing='ij' so that grid_y corresponds to rows and grid_x to columns
-    grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
-    grid_x = grid_x.unsqueeze(0).unsqueeze(0)  # shape (1, 1, H, W)
-    grid_y = grid_y.unsqueeze(0).unsqueeze(0)  # shape (1, 1, H, W)
-
-    # Compute expected coordinates by summing over spatial dimensions weighted by the softmax probabilities
-    expected_x = (softmax_heatmaps * grid_x).sum(dim=(-2, -1))
-    expected_y = (softmax_heatmaps * grid_y).sum(dim=(-2, -1))
-    coords = torch.stack([expected_x, expected_y], dim=-1)  # (B, K, 2)
-    return coords
-
 
 @ROI_KEYPOINT_HEAD_REGISTRY.register()
 class RangeKRCNNConvDeconvUpsampleHead(KRCNNConvDeconvUpsampleHead, nn.Sequential):
@@ -537,11 +468,12 @@ class RangeKRCNNConvDeconvUpsampleHead(KRCNNConvDeconvUpsampleHead, nn.Sequentia
             normalizer = (
                 None if self.loss_normalizer == "visible" else num_images * self.loss_normalizer
             )
-            keypoint_loss, range_loss = range_keypoint_rcnn_loss(x, instances, normalizer=normalizer, range_imgs=range_imgs)
+            keypoint_loss, range_loss, heatmap_loss = range_keypoint_rcnn_loss(x, instances, normalizer=normalizer, range_imgs=range_imgs)
             return {
                 "loss_keypoint": keypoint_loss
                 * self.loss_weight,
-                "range_loss": range_loss * self.loss_weight
+                "range_loss": range_loss * 10,
+                "heatmap_loss": heatmap_loss * 1
             }
         else:
             keypoint_rcnn_inference(x, instances)
