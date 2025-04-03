@@ -143,7 +143,7 @@ def range_keypoint_rcnn_loss(pred_keypoint_logits, instances, normalizer, range_
         storage = get_event_storage()
         storage.put_scalar("kpts_num_skipped_batches", _TOTAL_SKIPPED, smoothing_hint=False)
         zero_loss = pred_keypoint_logits.sum() * 0
-        return zero_loss, zero_loss
+        return zero_loss, zero_loss, zero_loss
 
     N, K, S, _ = pred_keypoint_logits.shape
     pred_logits_orig = pred_keypoint_logits  # shape (N, K, S, S)
