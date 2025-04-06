@@ -38,6 +38,7 @@ def setup_cfg(args):
     configurator = config_factory("irf")
     cfg = configurator.config_setup(train_name="greeting_train", val_name="greeting_val")    # cuda context is initialized before creating dataloader, so we don't fork anymore
     cfg.DATALOADER.NUM_WORKERS = 0
+    print(cfg)
     add_pointrend_config(cfg)
     # cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
@@ -137,7 +138,7 @@ def export_tracing(torch_model, inputs):
         dump_torchscript_IR(ts_model, args.output)
     elif args.format == "onnx":
         with PathManager.open(os.path.join(args.output, "model.onnx"), "wb") as f:
-            torch.onnx.export(traceable_model, (image,), f, opset_version=STABLE_ONNX_OPSET_VERSION)
+            torch.onnx.export(traceable_model, (image,), f, opset_version=STABLE_ONNX_OPSET_VERSION, verbose=True)
     logger.info("Inputs schema: " + str(traceable_model.inputs_schema))
     logger.info("Outputs schema: " + str(traceable_model.outputs_schema))
 
@@ -192,8 +193,11 @@ def get_sample_irf(args, do_resize=False):
     config_type = "irf"
     read_strategy = IRFGreetingDatasetMapper.read_irf_images if config_type == "irf" else cv2.imread
     sample_inputs = read_strategy(args.sample_image)
+    _, original_width = sample_inputs.shape[:2]
+    assert original_width >= args.width
+    # resize
+    sample_inputs = sample_inputs[:, int(original_width/2 - args.width / 2):int(original_width/2 + args.width / 2), : ]
     height, width = sample_inputs.shape[:2]
-    # No need for resize
     image = torch.as_tensor(sample_inputs.astype("float32").transpose(2, 0, 1))
 
     inputs = {"image": image, "height": height, "width": width}
@@ -220,6 +224,7 @@ def main() -> None:
     parser.add_argument("--sample-image", default=None, type=str, help="sample image for input")
     parser.add_argument("--run-eval", action="store_true")
     parser.add_argument("--output", help="output directory for the converted model")
+    parser.add_argument("--width", type=int, required=True, default=1024, help="image width, must be a multiple of 32")
     parser.add_argument(
         "opts",
         help="Modify config options using the command-line",
