@@ -206,6 +206,10 @@ class PeriodicCheckpointer(_PeriodicCheckpointer, HookBase):
         # No way to use **kwargs
         self.step(self.trainer.iter)
 
+    def after_train(self):
+        # Always save last model
+        self.step(self.max_iter)
+
 
 class BestCheckpointer(HookBase):
     """
