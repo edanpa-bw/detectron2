@@ -28,10 +28,10 @@ from detectron2.utils.env import TORCH_VERSION
 from detectron2.utils.file_io import PathManager
 from detectron2.utils.logger import setup_logger
 
-from lidar_greeting.configs.train_configs import config_factory
-from lidar_greeting.dev.dataset_utils import register_coco_custom_dataset
-from lidar_greeting.dev.evaluators import IRFPredictor, get_evaluation_loader
-from lidar_greeting.dev.greeting_mapper import IRFGreetingDatasetMapper
+from ai_greeting_model.configs.train_configs import config_factory
+from ai_greeting_model.dev.dataset_utils import register_coco_custom_dataset
+from ai_greeting_model.dev.evaluators import get_evaluation_loader
+from ai_greeting_model.dev.greeting_mapper import IRFGreetingDatasetMapper
 
 
 def setup_cfg(args):
